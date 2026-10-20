@@ -1,0 +1,288 @@
+"""What a desktop's window does to the peers list, and the words it uses for pairing.
+
+Pure, and shared by both desktops so a machine pairing with either reads the same sentences. The
+settings layer calls `add_peer` from `PairingService`'s `store` and `remove_peer` from the Remove
+button, each under its own settings lock; neither touches a file.
+"""
+
+import copy
+import time
+from typing import Optional
+
+from core import pairing, protocol
+from core.i18n import tr
+
+
+class RefusalThrottle:
+    """One native notice per identical refusal during a sustained crossing attempt."""
+
+    interval = 30.0
+
+    def __init__(self):
+        self._last: dict[str, float] = {}
+
+    def allow(self, message: str, now: Optional[float] = None) -> bool:
+        if not message:
+            return False
+        now = time.monotonic() if now is None else now
+        previous = self._last.get(message)
+        self._last = {text: stamp for text, stamp in self._last.items() if now - stamp < self.interval}
+        if previous is not None and now - previous < self.interval:
+            return False
+        self._last[message] = now
+        return True
+
+    def reset(self) -> None:
+        self._last.clear()
+
+UNNAMED = "Unnamed machine"
+TAIL = 4
+
+
+def desktops(peers: list) -> list:
+    return [entry for entry in peers if isinstance(entry, dict) and entry.get("port") != 0]
+
+
+def first_desktop(peers: list) -> Optional[dict]:
+    return next(iter(desktops(peers)), None)
+
+
+def normalise_phones(settings: dict) -> bool:
+    """Discard receiving-only fields for zero-port senders; keep their trust and permissions."""
+    changed = False
+    phones = set()
+    for entry in settings.get("peers", []):
+        if not isinstance(entry, dict) or entry.get("port") != 0:
+            continue
+        if isinstance(entry.get("id"), str):
+            phones.add(entry["id"])
+        for key, value in (("send", False), ("host", ""), ("hw", ""), ("side", ""),
+                           ("side_set_at", 0), ("side_by", ""), ("jump_key", "")):
+            if entry.get(key, value) != value:
+                changed = True
+            if key in entry or key == "send":
+                entry[key] = value
+        for key in ("way_back", "way_back_by"):
+            if key in entry:
+                del entry[key]
+                changed = True
+    if isinstance(settings.get("zones"), list):
+        zones = [zone for zone in settings["zones"] if not isinstance(zone, dict)
+                 or not isinstance(zone.get("peer"), str) or zone["peer"] not in phones]
+        if zones != settings["zones"]:
+            settings["zones"] = zones
+            changed = True
+    if isinstance(settings.get("design_follow_peer"), str) and settings["design_follow_peer"] in phones:
+        settings["design_follow_peer"] = ""
+        changed = True
+    return changed
+
+
+def _name(entry: dict) -> str:
+    label = entry.get("label")
+    label = label.strip()[:64] if isinstance(label, str) else ""
+    name = entry.get("name")
+    return label or (name.strip() if isinstance(name, str) else "")
+
+
+def labels(peers: list) -> dict:
+    """token -> what to call each machine: its name, and where two share one (ignoring case and
+    surrounding space) the last four characters of its id too, so the two can be told apart. An
+    entry that has no id yet (the one migrated from 1.4.x) shows the name alone. Paired phones keep
+    their labels for the direction that sends input here; incomplete entries without a token do not."""
+    peers = [entry for entry in peers if isinstance(entry, dict) and "token" in entry]
+    counts = {}
+    for entry in peers:
+        key = _name(entry).casefold()
+        counts[key] = counts.get(key, 0) + 1
+    result = {}
+    for entry in peers:
+        name = _name(entry) or entry.get("host") or UNNAMED
+        shared = counts[_name(entry).casefold()] > 1 and _name(entry)
+        ident = entry.get("id") or ""
+        result[entry["token"]] = f"{name} ({ident[-TAIL:]})" if shared and ident else name
+    return result
+
+
+def sharing_a_name(machines: list) -> list:
+    """For each machine heard, in order, whether another in the list has its name (as `labels()`
+    compares them): one machine heard on two interfaces is two rows, told apart by address."""
+    counts = {}
+    for machine in machines:
+        key = _name(machine).casefold()
+        counts[key] = counts.get(key, 0) + 1
+    return [counts[_name(machine).casefold()] > 1 for machine in machines]
+
+
+def label_for(peers: list, *, token: Optional[str] = None, peer_id: Optional[str] = None, host: Optional[str] = None) -> str:
+    """`labels()` for one machine, found by its token, its id (`b64`) or its address, in that order of
+    preference; "" when none matches. What a status or a notice calls a machine, so two of one name
+    are told apart there as they are in the list."""
+    peers = [entry for entry in peers if isinstance(entry, dict)]
+    shown = labels(peers)
+    for key, value in (("token", token), ("id", peer_id), ("host", host)):
+        if value:
+            found = next((entry for entry in peers if entry.get(key) == value), None)
+            if found is not None:
+                if found.get("port") == 0:
+                    return ""
+                return shown.get(found.get("token")) or _name(found) or found.get("host") or ""
+    return ""
+
+
+def dormant_reason(entry: dict) -> Optional[str]:
+    """Why a saved peer needs pairing again, or None when the link has not proved that it is stale."""
+    if entry.get("dormant") is not True:
+        return None
+    reason = entry.get("dormant_reason")
+    return {
+        "wrong_id": tr("The saved pairing now identifies a different machine."),
+        "forgotten": tr("The other machine no longer has this pairing."),
+    }.get(reason, tr("This pairing needs to be set up again."))
+
+
+def paired_ids(peers: list, exclude: Optional[str] = None) -> list:
+    """The valid, live desktop ids listed in a `paired` message, less its receiver."""
+    ids = []
+    for entry in peers:
+        if (not isinstance(entry, dict) or entry.get("port") == 0
+                or entry.get("in_use", True) is False or dormant_reason(entry) is not None):
+            continue
+        ident = entry.get("id")
+        if ident != exclude and protocol.read_id(ident) is not None:
+            ids.append(ident)
+            if len(ids) == protocol.MAX_PEERS:
+                break
+    return ids
+
+
+def add_peer(settings: dict, entry: dict, replaced: Optional[dict] = None) -> None:
+    """Puts a newly paired `entry` in `settings` (WIRE.md section 6, item 5). `replaced`, an entry
+    as `peers()` gave it, is dropped by its token and the new one takes its place: the first desktop
+    is the one the flat settings read, so its replacement must not slip behind. Zones that name
+    an id no entry has any more go with it; a machine paired again under its own id keeps its zones.
+    The entry migrated from 1.4.x (`id` empty) gives its side and zones to a pairing with the machine
+    at its saved host on its platform (section 6, item 4): that is the machine the user meant to pair
+    again, and a match by name alone takes nothing, a name being anyone's to claim."""
+    peers = settings["peers"]
+    at = next((index for index, held in enumerate(peers) if replaced is not None and held.get("token") == replaced.get("token")), None)
+    if at is None:
+        peers.append(entry)
+    else:
+        old = peers[at]
+        peers[at] = entry
+        if old.get("id") and old.get("id") == entry.get("id"):
+            for field in ("label", "left_out", "left_out_ways", "side", "side_set_at", "side_by"):
+                if field in old:
+                    entry[field] = copy.deepcopy(old[field])
+    if (replaced is not None and replaced.get("from_1_4") is True and replaced.get("id") == "" and entry.get("id")
+            and replaced.get("host") and replaced.get("host") == entry.get("host")
+            and replaced.get("platform") == entry.get("platform")):
+        entry.update({field: replaced.get(field, default) for field, default in
+                      (("side", ""), ("side_set_at", 0), ("side_by", ""))})
+        for zone in settings["zones"]:
+            if zone.get("peer") == "":
+                zone["peer"] = entry["id"]
+    _drop_orphan_zones(settings)
+    # Imported here: ways names machines by this module's labels.
+    from core import ways
+    ways.ensure_zones(settings)
+
+
+def remove_peer(settings: dict, token: str) -> Optional[dict]:
+    """Takes the entry holding `token` out of `settings` with its zones, and returns it; None when
+    there is none."""
+    peers = settings["peers"]
+    at = next((index for index, held in enumerate(peers) if held.get("token") == token), None)
+    if at is None:
+        return None
+    removed = peers.pop(at)
+    _drop_orphan_zones(settings)
+    layout = settings.get("layout")
+    if isinstance(layout, dict):
+        from core import ways
+        ways.prune_layout(settings)
+    return removed
+
+
+def _drop_orphan_zones(settings: dict) -> None:
+    ids = {held.get("id") for held in settings["peers"]}
+    settings["zones"] = [zone for zone in settings["zones"] if zone.get("peer") in ids]
+
+
+def day(paired_at) -> str:
+    """The day an entry was paired, DD-MM-YYYY in this machine's local time; "" when unknown."""
+    if not isinstance(paired_at, int) or isinstance(paired_at, bool) or paired_at <= 0:
+        return ""
+    return time.strftime("%d-%m-%Y", time.localtime(paired_at))
+
+
+def pairing_error_text(error: Exception, name: str) -> str:
+    """A requester's failure, said to its user; `name` is how the machine is shown (its label, or
+    "That machine" when it is not known yet, which starts a sentence)."""
+    if isinstance(error, pairing.AlreadyPaired):
+        entry = error.entry
+        if entry is None:
+            return tr("That is this machine, not another one.")
+        label = _name(entry) or name
+        when = day(entry.get("paired_at"))
+        if when:
+            return tr("{name} is already paired with this machine, since {when}. Remove it from the list first to pair again.").format(name=label, when=when)
+        return tr("{name} is already paired with this machine. Remove it from the list first to pair again.").format(name=label)
+    reason = str(error)
+    if reason == pairing.ERROR_NOT_PAIRING:
+        return tr("{name} is not showing a code. Show one in Beamer on it, then try again.").format(name=name)
+    if reason == pairing.ERROR_REFUSED:
+        return tr("That code was not accepted, and {name} has cancelled it. Show a new one there to try again.").format(name=name)
+    if reason == pairing.ERROR_VERSION:
+        return tr("{name} runs an older Beamer. Update Beamer on it to 1.5.0, then pair again.").format(name=name)
+    if reason == "no_answer":
+        return tr("{name} did not answer. Check both machines are on the same network, then try again.").format(name=name)
+    if reason == pairing.ERROR_FULL:
+        return tr("Either this machine or {name} already has {n} machines paired, the most Beamer keeps. Remove one, then try again.").format(name=name, n=pairing.MAX_PEERS)
+    if reason == pairing.ERROR_KNOWN:
+        return tr("{name} already has this machine paired. Remove this machine from its list there, then pair again.").format(name=name)
+    if reason == "not_saved":
+        return tr("Pairing finished, but Beamer could not save it on this machine. Try again in a moment.")
+    if reason == "busy":
+        return tr("Another pairing is still finishing. Try again in a moment.")
+    return tr("Pairing failed: {reason}.").format(reason=reason)
+
+
+def refusal_text(why: str, name: str, other: Optional[str]) -> Optional[str]:
+    """The alert for an `owned` or `busy` refusal, naming the machine in the way when known."""
+    if why == "owned":
+        return (tr("Can't cross to {name}: it is being driven from {other}.").format(name=name, other=other) if other else
+                tr("Can't cross to {name}: another machine is driving it.").format(name=name))
+    if why == "busy":
+        return (tr("Can't cross to {name}: it is driving {other}.").format(name=name, other=other) if other else
+                tr("Can't cross to {name}: it is driving another machine.").format(name=name))
+    return None
+
+
+def host_outcome_text(outcome: Optional[str], entry: Optional[dict]) -> str:
+    """How the code on screen ended, said to the person at this machine (`PairingService.outcome`,
+    with `entry` the machine that paired or, for `known`, the entry it was found to be); "" while
+    a code is live or after a deliberate cancel."""
+    name = _name(entry or {}) or "A machine"
+    if outcome == "paired":
+        return tr("Paired with {name}.").format(name=name)
+    if outcome == "refused":
+        return tr("A wrong code was tried, so this code was cancelled. Show a new one to try again.")
+    if outcome == "version":
+        return tr("A machine on an older Beamer tried to pair. Update Beamer on it to 1.5.0, then show a new code.")
+    if outcome == "expired":
+        return tr("The code expired. Show a new one.")
+    if outcome == "known":
+        if entry is None:
+            return tr("That machine gave this machine's own identity, so nothing was paired. Show a new code to try again.")
+        if day(entry.get("paired_at")):
+            return tr("{name} is already paired here, since {when}. Remove it from the list first to pair again.").format(name=name, when=day(entry.get("paired_at")))
+        return tr("{name} is already paired here. Remove it from the list first to pair again.").format(name=name)
+    if outcome == "known_there":
+        return tr("That machine may already be paired here, or the code was wrong. Show a new code to try again.")
+    if outcome == "full":
+        return tr("This machine already has {n} machines paired, the most Beamer keeps. Remove one, then show a new code.").format(n=pairing.MAX_PEERS)
+    if outcome == "not_saved":
+        return tr("Beamer could not save the pairing on this machine, so it did not complete. Show a new code to try again.")
+    return ""

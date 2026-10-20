@@ -1,0 +1,8 @@
+# The repo is LF throughout, and half of it is edited on Windows. Without this,
+# every tool that rewrites a file there stores it with CRLF and the diff is the
+# whole file for no change at all. Git normalises on commit, so it cannot happen
+# whichever machine the edit was made on.
+* text=auto eol=lf
+
+# Vendored as they came: a third party's licence file is not ours to reflow.
+win_app/assets/** -text
